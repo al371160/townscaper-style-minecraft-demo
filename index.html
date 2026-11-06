@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Townscaper Voxel Terrain</title>
+<style>
+  :root {
+    --panel: rgba(14, 18, 24, 0.78);
+    --line: rgba(255, 255, 255, 0.12);
+    --text: #e8edf2;
+    --muted: #93a1b0;
+    --accent: #ffd166;
+    --font: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e12; color: var(--text); font: 12px/1.45 var(--font); }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  .panel { position: fixed; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; backdrop-filter: blur(6px); }
+  #hud { top: 12px; left: 12px; padding: 10px 12px; min-width: 300px; pointer-events: none; }
+  #hud h1 { margin: 0 0 6px; font-size: 13px; letter-spacing: 0.04em; color: var(--accent); font-weight: 600; }
+  #stats b { color: var(--accent); }
+  #panel { top: 12px; right: 12px; width: 268px; padding: 12px; max-height: calc(100% - 24px); overflow: auto; }
+  #panel section + section { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+  label { display: block; color: var(--muted); margin-bottom: 4px; }
+  .row { display: flex; gap: 6px; align-items: center; }
+  input[type=text] { flex: 1; min-width: 0; background: #0b0e12; color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; font: inherit; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  button { background: #1d2530; color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px; font: inherit; cursor: pointer; }
+  button:hover { background: #283240; }
+  button.primary { background: var(--accent); color: #1a1405; border-color: transparent; font-weight: 600; }
+  .check { display: flex; gap: 6px; align-items: center; color: var(--text); margin: 4px 0; cursor: pointer; }
+  .stack { display: grid; gap: 6px; }
+  #atlas { width: 100%; image-rendering: pixelated; border-radius: 4px; border: 1px solid var(--line); display: block; }
+  .keys { color: var(--muted); }
+  .keys kbd { color: var(--text); background: #1d2530; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: inherit; }
+  #crosshair { position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px; pointer-events: none; }
+  #crosshair::before, #crosshair::after { content: ""; position: absolute; background: rgba(255,255,255,0.85); mix-blend-mode: difference; }
+  #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
+  #crosshair::after { top: 8px; left: 0; height: 2px; width: 18px; }
+  #lockHint { position: fixed; left: 50%; top: 58%; transform: translateX(-50%); padding: 8px 14px; pointer-events: none; color: var(--text); }
+  #bottom { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); text-align: center; pointer-events: none; }
+  #hotbar { display: flex; gap: 4px; padding: 5px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  #hotbar canvas { width: 36px; height: 36px; image-rendering: pixelated; border: 2px solid transparent; border-radius: 4px; }
+  #hotbar canvas.sel { border-color: var(--accent); }
+  #hotbarName { margin-top: 4px; color: var(--muted); text-shadow: 0 1px 2px #000; }
+  #pipeline { inset: 0; margin: auto; width: min(620px, calc(100% - 32px)); height: fit-content; max-height: calc(100% - 32px); overflow: auto; padding: 14px; z-index: 10; }
+  #pipeline h2 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
+  #pipeTabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+  #pipeTabs button.active { background: var(--accent); color: #1a1405; }
+  #pipeCanvas { width: 100%; aspect-ratio: 1; border-radius: 6px; display: block; }
+  #pipeDesc { color: var(--muted); margin-top: 8px; min-height: 3em; }
+  #pipeClose { position: absolute; top: 10px; right: 12px; }
+  .hidden { display: none !important; }
+  @media (max-width: 720px) { #panel { width: calc(100% - 24px); top: auto; bottom: 12px; max-height: 45%; } #hud { min-width: 0; right: 12px; } #bottom { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="crosshair"></div>
+
+<div id="hud" class="panel">
+  <h1>TOWNSCAPER × VOXEL TERRAIN</h1>
+  <div id="stats">loading…</div>
+</div>
+
+<div id="panel" class="panel">
+  <section>
+    <label for="seed">World seed</label>
+    <form id="seedForm" class="row">
+      <input id="seed" type="text" spellcheck="false" autocomplete="off">
+      <button class="primary" type="submit">Go</button>
+      <button id="randomSeed" type="button" title="Random seed">⟳</button>
+    </form>
+  </section>
+  <section>
+    <label>Render distance <span id="rdVal"></span> chunk rings</label>
+    <input id="rd" type="range" min="2" max="14" step="1">
+    <label>Fly speed <span id="speedVal"></span></label>
+    <input id="speed" type="range" min="5" max="120" step="1">
+    <label>Time of day</label>
+    <input id="tod" type="range" min="0" max="1" step="0.001">
+    <label class="check"><input id="cycle" type="checkbox"> Day/night cycle <span class="keys">(T)</span></label>
+    <label class="check"><input id="gridToggle" type="checkbox"> Show Townscaper grid <span class="keys">(G)</span></label>
+  </section>
+  <section class="stack">
+    <button id="modeBtn">Flight mode (F)</button>
+    <button id="pipeBtn">Grid pipeline viewer (P)</button>
+    <button id="teleport">Teleport ±1,000,000 blocks</button>
+  </section>
+  <section>
+    <label>Generated texture atlas <a href="#" id="atlasDl" style="color:var(--accent)">save png</a></label>
+    <canvas id="atlas"></canvas>
+  </section>
+  <section class="keys">
+    <kbd>Click</kbd> capture mouse · <kbd>WASD</kbd> move<br>
+    <kbd>E</kbd>/<kbd>Q</kbd> up/down (flight) · <kbd>Space</kbd> jump/swim<br>
+    <kbd>Shift</kbd> sprint · <kbd>F</kbd> flight ⇄ walk<br>
+    <kbd>LMB</kbd> break · <kbd>RMB</kbd> place (3 blocks)<br>
+    <kbd>1-9</kbd>/wheel pick block
+  </section>
+</div>
+
+<div id="lockHint" class="panel">Click to look around</div>
+<div id="bottom"><div id="hotbar"></div><div id="hotbarName"></div></div>
+
+<div id="pipeline" class="panel hidden">
+  <h2>Townscaper grid → noise terrain</h2>
+  <button id="pipeClose">✕</button>
+  <div id="pipeTabs"></div>
+  <canvas id="pipeCanvas" width="900" height="900"></canvas>
+  <div id="pipeDesc"></div>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
