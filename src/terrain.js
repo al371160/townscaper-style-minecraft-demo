@@ -10,8 +10,33 @@
 //   • caves: 3D noise in Y∈[1,128] → EMPTY (LAVA when Y < 25), BEDROCK at Y = 0
 // Extras: temperature/moisture biomes (desert, snowy plains), rivers, ores, trees.
 
+//
+// Hex-guided mode (default): before the hexagon is split into triangles, it already
+// carries two smooth structures that shape the terrain:
+//   • a control lattice: every hexagon centre + corner (a triangular lattice of
+//     spacing L). Macro height is sampled only there and blended with a C² Wendland
+//     partition of unity, so the surface is smooth instead of noisy per cell.
+//   • guide curves: every hexagon pairs its 6 edge midpoints with 3 non-crossing
+//     cubic Béziers (hex Truchet tile: three corner arcs, or one straight line +
+//     two arcs). Tangents are perpendicular to the edge, and midpoints are jittered
+//     by an edge hash shared by both hexes, so the curves join G¹-smoothly across
+//     chunks into endless winding lines. Ridges and swales follow these curves.
+
 import { Simplex, hash3 } from './noise.js';
 import * as B from './blocks.js';
+import { L, SQ3, worldToChunk, chunkCenterWorld } from './grid.js';
+
+// non-crossing pairings of the 6 hexagon edges (Catalan(3) = 5)
+export const TRUCHET = [
+  [[0, 1], [2, 3], [4, 5]], [[1, 2], [3, 4], [5, 0]],
+  [[0, 3], [1, 2], [4, 5]], [[1, 4], [2, 3], [5, 0]], [[2, 5], [3, 4], [0, 1]],
+];
+const EDGE_NB = [[1, 0], [0, 1], [-1, 1], [-1, 0], [0, -1], [1, -1]]; // neighbour across edge k
+const APO = (L * SQ3) / 2;           // hexagon apothem (centre → edge midpoint)
+const SEG = 14;                      // polyline segments per guide curve
+const RKER = 1.5 * L;                // Wendland kernel radius over the control lattice
+const LAT_DZ = L * SQ3 * 0.5;
+const W_LOW = 7, W_MNT = 9;          // half-widths of swales / mountain ridges
 
 export const H = 256;
 export const SEA = 138;
@@ -21,8 +46,11 @@ const sstep = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t 
 const INV32 = 1 / 4294967296;
 
 export class Terrain {
-  constructor(seed) {
+  constructor(seed, guided = true) {
     this.seed = seed >>> 0;
+    this.guided = guided;
+    this.ctrl = new Map();   // control lattice heights
+    this.hexes = new Map();  // hexagon guide curves
     const s = (k) => hash3(this.seed, k, 0x51ed);
     this.nBlend = new Simplex(s(1));
     this.nHill = new Simplex(s(2));
@@ -34,6 +62,8 @@ export class Terrain {
     this.nCaveA = new Simplex(s(8));
     this.nCaveB = new Simplex(s(9));
     this.wseed = s(10);
+    this.nGuide = new Simplex(s(11));
+    this.hseed = s(12);
     // outputs of info()
     this.h = 0; this.t = 0; this.temp = 0; this.moist = 0; this.treeKind = 0;
   }
@@ -73,11 +103,132 @@ export class Terrain {
     return 142 + (s / t) * 108;
   }
 
+  blend(x, z) { return sstep(0.25, 0.75, 0.5 + 0.5 * this.fbm(this.nBlend, x / 1100, z / 1100, 2) * 1.25); }
+  raw(x, z) { const t = this.blend(x, z); return this.grassland(x, z) * (1 - t) + this.mountain(x, z) * t; }
+
+  // ---- hex-guided structures -------------------------------------------------
+  // macro height at control-lattice node (i, j): position i·(L,0) + j·(L/2, L√3/2)
+  ctrlH(i, j) {
+    const k = (i + 1048576) * 2097152 + (j + 1048576);
+    let v = this.ctrl.get(k);
+    if (v === undefined) {
+      if (this.ctrl.size > 60000) this.ctrl.clear();
+      v = this.raw(i * L + j * L * 0.5, j * LAT_DZ);
+      this.ctrl.set(k, v);
+    }
+    return v;
+  }
+
+  // smooth macro height: Wendland C² partition of unity over the hexagon centre/corner lattice
+  smoothBase(x, z) {
+    const jc = Math.floor(z / LAT_DZ);
+    let sw = 0, sv = 0;
+    for (let j = jc - 1; j <= jc + 2; j++) {
+      const ic = Math.floor((x - j * L * 0.5) / L);
+      for (let i = ic - 1; i <= ic + 2; i++) {
+        const dx = i * L + j * L * 0.5 - x, dz = j * LAT_DZ - z;
+        const d = Math.sqrt(dx * dx + dz * dz) / RKER;
+        if (d >= 1) continue;
+        const a = 1 - d, w = a * a * a * a * (4 * d + 1);
+        sw += w; sv += w * this.ctrlH(i, j);
+      }
+    }
+    return sv / sw;
+  }
+
+  // jittered midpoint of the edge shared by hexes A and B (identical from both sides)
+  edgeMid(qa, ra, qb, rb) {
+    if (qb < qa || (qb === qa && rb < ra)) { let t = qa; qa = qb; qb = t; t = ra; ra = rb; rb = t; }
+    const [ax, az] = chunkCenterWorld(qa, ra), [bx, bz] = chunkCenterWorld(qb, rb);
+    const s = ((hash3(this.hseed, qa + qb, ra + rb) & 0xffff) / 65535 - 0.5) * 0.45 * L; // along the edge
+    const ex = -(bz - az) / (L * SQ3), ez = (bx - ax) / (L * SQ3);
+    return [(ax + bx) * 0.5 + ex * s, (az + bz) * 0.5 + ez * s];
+  }
+
+  // three guide curves of hexagon (q,r) as polylines: Float64Array(3·(SEG+1)·2)
+  hexCurves(q, r) {
+    const key = q * 1e7 + r;
+    let hc = this.hexes.get(key);
+    if (hc) return hc;
+    if (this.hexes.size > 8000) this.hexes.clear();
+    const hv = hash3(this.hseed ^ 0x9e3779b9, q, r);
+    const pattern = TRUCHET[hv % 5];
+    const [ox, oz] = chunkCenterWorld(q, r);
+    const pts = new Float64Array(3 * (SEG + 1) * 2);
+    pattern.forEach(([a, b], ci) => {
+      const [ax, az] = this.edgeMid(q, r, q + EDGE_NB[a][0], r + EDGE_NB[a][1]);
+      const [bx, bz] = this.edgeMid(q, r, q + EDGE_NB[b][0], r + EDGE_NB[b][1]);
+      // inward normals (towards the hex centre) keep curves perpendicular to the edges
+      const na = (Math.PI / 6) + (Math.PI / 3) * a, nb = (Math.PI / 6) + (Math.PI / 3) * b;
+      const straight = (a - b + 6) % 6 === 3;
+      const base = straight ? APO * 0.66 : 6.2;
+      const ka = base * (0.7 + 0.6 * (((hv >>> (8 + ci * 4)) & 15) / 15));
+      const kb = base * (0.7 + 0.6 * (((hv >>> (20 + ci * 4)) & 15) / 15));
+      const p1x = ax - Math.cos(na) * ka, p1z = az - Math.sin(na) * ka;
+      const p2x = bx - Math.cos(nb) * kb, p2z = bz - Math.sin(nb) * kb;
+      for (let s = 0; s <= SEG; s++) {
+        const t = s / SEG, u = 1 - t;
+        const w0 = u * u * u, w1 = 3 * u * u * t, w2 = 3 * u * t * t, w3 = t * t * t;
+        const o = (ci * (SEG + 1) + s) * 2;
+        pts[o] = w0 * ax + w1 * p1x + w2 * p2x + w3 * bx;
+        pts[o + 1] = w0 * az + w1 * p1z + w2 * p2z + w3 * bz;
+      }
+    });
+    hc = { q, r, ox, oz, pattern, pts };
+    this.hexes.set(key, hc);
+    return hc;
+  }
+
+  // smooth union of guide-curve bumps around (x,z): writes this.gLow / this.gMnt ∈ [0,1]
+  guides(x, z) {
+    const [q, r] = worldToChunk(x, z);
+    const [ox, oz] = chunkCenterWorld(q, r);
+    const lx = x - ox, lz = z - oz;
+    let keepLow = 1, keepMnt = 1;
+    for (let k = -1; k < 6; k++) {
+      let hq = q, hr = r;
+      if (k >= 0) {
+        // a neighbour's curves can only matter when we are close to that shared edge
+        const a = Math.PI / 6 + (Math.PI / 3) * k;
+        if (lx * Math.cos(a) + lz * Math.sin(a) < APO - W_MNT - 4) continue;
+        hq += EDGE_NB[k][0]; hr += EDGE_NB[k][1];
+      }
+      const pts = this.hexCurves(hq, hr).pts;
+      for (let ci = 0; ci < 3; ci++) {
+        let best = 1e9;
+        for (let s = 0; s < SEG; s++) {
+          const o = (ci * (SEG + 1) + s) * 2;
+          const ax = pts[o], az = pts[o + 1], bx = pts[o + 2], bz = pts[o + 3];
+          const ex = bx - ax, ez = bz - az;
+          let t = ((x - ax) * ex + (z - az) * ez) / (ex * ex + ez * ez);
+          t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const dx = ax + ex * t - x, dz = az + ez * t - z;
+          const d2 = dx * dx + dz * dz;
+          if (d2 < best) best = d2;
+        }
+        const d = Math.sqrt(best);
+        if (d < W_LOW) keepLow *= sstep(0, W_LOW, d);
+        if (d < W_MNT) keepMnt *= sstep(0, W_MNT, d);
+      }
+    }
+    this.gLow = 1 - keepLow; this.gMnt = 1 - keepMnt;
+  }
+
   // Height + biome parameters at (x,z). Results are written to this.h / this.t / this.temp / this.moist.
   info(x, z) {
-    const b = this.fbm(this.nBlend, x / 1100, z / 1100, 2) * 1.25;
-    const t = sstep(0.25, 0.75, 0.5 + 0.5 * b);
-    let h = this.grassland(x, z) * (1 - t) + this.mountain(x, z) * t;
+    const t = this.blend(x, z);
+    let h;
+    if (this.guided) {
+      h = this.smoothBase(x, z);
+      this.guides(x, z);
+      // lowlands: gentle swales (−) or berms (+) follow the curves, sign drifts across the map
+      const sgn = Math.max(-1, Math.min(1, this.fbm(this.nGuide, x / 420, z / 420, 2) * 2.2));
+      h += this.gLow * sgn * 3.5 * (1 - t);
+      // mountains: rounded ridgelines run along the same curves
+      h += this.gMnt * t * t * 14;
+    } else {
+      h = this.grassland(x, z) * (1 - t) + this.mountain(x, z) * t;
+    }
     // rivers carve the lowlands
     const rv = Math.abs(this.nRiver.noise2D(x / 620, z / 620) + 0.3 * this.nRiver.noise2D(x / 150, z / 150));
     const rb = (1 - sstep(0.02, 0.085, rv)) * (1 - clamp01(t * 2.2));

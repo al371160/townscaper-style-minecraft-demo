@@ -275,6 +275,7 @@ const state = {
   fly: true,
   tod: 0.36, cycle: true,
   hotbar: 0,
+  guided: params.get('classic') !== '1',
 };
 const parseSeed = (s) => (/^-?\d+$/.test(s.trim()) ? (parseInt(s, 10) >>> 0) : hashString(s));
 
@@ -300,7 +301,7 @@ function startWorkers() {
     const myEpoch = epoch;
     w.onmessage = (e) => { w.busy--; if (myEpoch === epoch) results.push(e.data); };
     w.onerror = (e) => console.error('worker error', e.message || e);
-    w.postMessage({ type: 'init', seed: state.seed, edits: [...editsMain].map(([k, m]) => [k, [...m]]) });
+    w.postMessage({ type: 'init', seed: state.seed, guided: state.guided, edits: [...editsMain].map(([k, m]) => [k, [...m]]) });
     workers.push(w);
   }
 }
@@ -312,11 +313,13 @@ function resetWorld() {
   for (const ch of chunks.values()) freeChunk(ch);
   chunks.clear(); results.length = 0; queue = []; editsMain.clear(); lastChunkKey = '';
   state.seed = parseSeed(state.seedText);
-  terrain = new Terrain(state.seed);
+  terrain = new Terrain(state.seed, state.guided);
   startWorkers();
   spawn();
   $('#seed').value = state.seedText;
-  const u = new URL(location.href); u.searchParams.set('seed', state.seedText); history.replaceState(null, '', u);
+  const u = new URL(location.href); u.searchParams.set('seed', state.seedText);
+  if (state.guided) u.searchParams.delete('classic'); else u.searchParams.set('classic', '1');
+  history.replaceState(null, '', u);
 }
 
 function spawn() {
@@ -812,6 +815,8 @@ $('#rd').oninput = (e) => { state.renderDist = +e.target.value; $('#rdVal').text
 $('#speed').value = state.speed; $('#speedVal').textContent = state.speed;
 $('#speed').oninput = (e) => { state.speed = +e.target.value; $('#speedVal').textContent = state.speed; };
 $('#gridToggle').onchange = (e) => { state.grid = e.target.checked; };
+$('#guided').checked = state.guided;
+$('#guided').onchange = (e) => { state.guided = e.target.checked; resetWorld(); };
 $('#cycle').checked = state.cycle;
 $('#cycle').onchange = (e) => { state.cycle = e.target.checked; };
 $('#tod').oninput = (e) => { state.tod = +e.target.value; };
@@ -845,7 +850,7 @@ drawHotbar();
 
 // ---------------------------------------------------------------- grid pipeline viewer
 let pipeStage = 4;
-const STAGES = ['1 · Hex triangles', '2 · Random merge', '3 · Subdivide', '4 · Relax', '5 · Tiled chunks', '6 · Noise terrain'];
+const STAGES = ['1 · Hex triangles', '2 · Random merge', '3 · Subdivide', '4 · Relax', '5 · Tiled chunks', '6 · Hex guides', '7 · Noise terrain'];
 {
   const tabs = $('#pipeTabs');
   STAGES.forEach((s, i) => {
@@ -907,7 +912,11 @@ function drawPipeline() {
         const pts = [0, 1, 2, 3].map((e) => P(g.vx[g.cells[c * 4 + e]], g.vz[g.cells[c * 4 + e]]));
         let fill;
         if (pipeStage === 5) fill = `hsl(${(i * 51 + 200) % 360} 45% ${(g.hash[c] & 1) ? 30 : 36}%)`;
-        else {
+        else if (pipeStage === 6) {
+          const h = terrain.info(g.cx[c], g.cz[c]);
+          const k = Math.max(8, Math.min(70, 8 + (h - 120) * 0.55));
+          fill = h <= SEA ? `hsl(205 45% ${Math.max(12, k - 6)}%)` : `hsl(${(140 - (h - SEA) * 1.1) | 0} 22% ${k}%)`;
+        } else {
           tmp.fill(0);
           const h = terrain.column(g.cx[c], g.cz[c], g.hash[c], tmp);
           let y = H - 1; while (y > 0 && tmp[y] === 0) y--;
@@ -915,11 +924,33 @@ function drawPipeline() {
           const k = Math.max(0.55, Math.min(1.35, 0.6 + (h - 128) / 110));
           fill = shadeHex(base, tmp[y] === B.WATER ? 0.75 + (h - 120) / 80 : k);
         }
-        poly(pts, fill, pipeStage === 5 ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.25)', 0.6);
+        poly(pts, fill, pipeStage === 5 ? 'rgba(255,255,255,0.35)' : pipeStage === 6 ? null : 'rgba(0,0,0,0.25)', 0.6);
       }
     });
+    if (pipeStage === 6 && state.guided) {
+      // original hexagons (before the triangle split), their control lattice and guide curves
+      list.forEach(([dq, dr]) => {
+        const hc = terrain.hexCurves(q + dq, r + dr);
+        const corners = [0, 1, 2, 3, 4, 5].map((k) => P(hc.ox + L * Math.cos(k * Math.PI / 3), hc.oz + L * Math.sin(k * Math.PI / 3)));
+        poly(corners, null, 'rgba(255,255,255,0.55)', 1.5);
+        ctx.fillStyle = '#ffd166';
+        [P(hc.ox, hc.oz), ...corners].forEach(([x, y]) => { ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill(); });
+        hc.pattern.forEach(([a, b], ci) => {
+          ctx.beginPath();
+          for (let s = 0; s <= 14; s++) {
+            const o = (ci * 15 + s) * 2, [x, y] = P(hc.pts[o], hc.pts[o + 1]);
+            if (s) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+          }
+          ctx.strokeStyle = (a - b + 6) % 6 === 3 ? '#ff8fa3' : '#7ee0ff'; ctx.lineWidth = 3; ctx.stroke();
+        });
+      });
+    }
     desc.textContent = pipeStage === 5
       ? 'Seven chunks: each one has its own seeded grid, but the shared lattice border makes the whole plane one continuous irregular grid.'
+      : pipeStage === 6
+      ? (state.guided
+        ? 'Before the triangle split, each hexagon carries smooth guides. Macro height is sampled only at hex centres + corners (yellow) and blended with a C² kernel. Each hex links its edge midpoints with Bézier curves (blue arcs, pink straight lines) that meet their neighbours tangentially, so ridges and swales flow across chunks. Cells are shaded by the resulting height.'
+        : 'Hex guides are off (classic per-cell noise). Enable "Hex-guided smooth terrain" in the panel.')
       : 'Noise terrain applied per cell: each irregular cell becomes a voxel column whose height & biome come from noise sampled at its centroid.';
   }
 }

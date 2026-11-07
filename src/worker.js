@@ -280,7 +280,7 @@ function build(q, r, deep) {
 self.onmessage = (e) => {
   const d = e.data;
   if (d.type === 'init') {
-    seed = d.seed >>> 0; terrain = new Terrain(seed); grids.clear(); edits.clear();
+    seed = d.seed >>> 0; terrain = new Terrain(seed, d.guided !== false); grids.clear(); edits.clear();
     if (d.edits) for (const [k, list] of d.edits) edits.set(k, new Map(list));
   } else if (d.type === 'edit') {
     const k = d.q + ',' + d.r + ',' + d.c;
